@@ -45,8 +45,6 @@ const startServer = (): Promise<void> => {
   });
 };
 
-startServer();
-
 // Handle signals to allow graceful shutdown
 process.on("SIGINT", () => {
   console.log("SIGINT received, shutting down server...");
@@ -60,11 +58,16 @@ process.on("SIGTERM", () => {
   process.exit(0);
 });
 
-// Keep process alive indefinitely
-setInterval(() => {
-  // This empty interval prevents Node.js from exiting
-}, 10000); // 10 second interval
+const serverPromise = startServer();
 
 console.log(
   `Azure Authentication Service running on ${ipc.config.networkHost}:${ipc.config.networkPort}`
 );
+
+// Use an IIFE to await the server start in a CommonJS module
+(async () => {
+  await serverPromise; // Wait for the server to start
+})().catch((err) => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
+});
