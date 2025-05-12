@@ -2,14 +2,6 @@
 
 # Define cleanup function to handle termination
 cleanup() {
-  # Clean up SSH connection running socat if it exists
-  if [ -n "$SOCAT_SSH_PID" ]; then
-    echo "Cleaning up socat SSH connection (PID: $SOCAT_SSH_PID)..."
-    kill $SOCAT_SSH_PID 2>/dev/null || true
-    wait $SOCAT_SSH_PID 2>/dev/null || true
-    echo "Socat SSH connection terminated"
-  fi
-
   # Clean up by killing the auth service process
   if [ -n "$ADO_AUTH_SERVICE_PID" ]; then
     echo "Stopping ado-auth-service (PID: $ADO_AUTH_SERVICE_PID)..."
@@ -36,14 +28,6 @@ echo "Selected codespace: $codespace"
 SOCKET_ID=$(uuidgen)
 SOCKET_PATH="/tmp/ado-auth-${SOCKET_ID}.sock"
 
-# Start a dedicated SSH connection to run socat continuously
-echo "Starting dedicated SSH connection for socat..."
-gh cs ssh -c "$codespace" -- -R 9000:localhost:9000 "socat UNIX-LISTEN:$SOCKET_PATH,fork TCP:localhost:9000" &
-SOCAT_SSH_PID=$!
-
-# Wait a moment for socat to start
-echo "Socat started in dedicated SSH connection with PID: $SOCAT_SSH_PID"
-
 # Start an interactive SSH session (no need to forward port again)
 echo "Starting interactive SSH session..."
-TERM=xterm-256color gh cs ssh -c "$codespace" -- -t
+TERM=xterm-256color gh cs ssh -c "$codespace" -- -R "$SOCKET_PATH:localhost:9000" -t

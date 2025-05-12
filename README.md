@@ -20,7 +20,6 @@ This tool does not *yet* provide the ado-auth-helper script, so initial configur
 - GitHub CLI (`gh`) installed and authenticated
 - Azure CLI (`az`) installed and logged in to the appropriate tenant
 - `fzf` for interactive codespace selection
-- `socat` installed on your codespace machine for Unix socket proxying for node-ipc to the forwarded port over SSH.
 
 ## Installation
 
@@ -70,28 +69,27 @@ graph
     
     subgraph "GitHub Codespace"
         SSHSrv["SSH Server"]
-        Socat["socat<br>(Unix Socket <-> TCP proxy)"]
+        SocketPath["Unix Socket<br>(direct SSH socket forwarding)"]
         ADOHelper["ADO Auth Helper<br>(from ado-codespaces-auth)"]
         Tools["Development Tools<br>(git, npm, dotnet, etc.)"]
         
-        SSHSrv -->|forwards TCP port 9000| Socat
-        Socat -->|UNIX socket IPC| ADOHelper
+        SSHSrv -->|forwards to Unix socket| SocketPath
+        SocketPath -->|UNIX socket IPC| ADOHelper
         ADOHelper -->|provides ADO tokens| Tools
         Tools -->|requests token| ADOHelper
-        ADOHelper -->|requests token via IPC| Socat
+        ADOHelper -->|requests token via IPC| SocketPath
     end
     
-    SSH -->|Remote Port Forwarding<br>-R 9000:localhost:9000| SSHSrv
-    Socat -.->|node-ipc over socket| AuthSvc
+    SSH -->|Remote Port Forwarding<br>-R /tmp/ado-auth-*.sock:localhost:9000| SSHSrv
+    SocketPath -.->|node-ipc over socket| AuthSvc
     Tools -.->|auth with ADO| Ext["Azure DevOps Services"]
 ```
 
 Under the hood, this tool:
 
 1. **Local Authentication Service**: Starts a Node.js service using the `@azure/identity` package that connects to your Azure CLI credentials
-2. **SSH Port Forwarding**: Establishes an SSH connection that forwards the local authentication service to the codespace
-3. **Unix Socket Proxying**: Uses `socat` to bridge the SSH port forwarding to a Unix socket in the codespace
-4. **Token Delivery**: Provides ADO access tokens to tools inside the codespace when needed
+2. **SSH Socket Forwarding**: Establishes an SSH connection that directly forwards the local authentication service to a Unix socket in the codespace using SSH's remote socket forwarding capability
+3. **Token Delivery**: Provides ADO access tokens to tools inside the codespace when needed
 
 This approach leverages the same tools and workflows that the official ADO Codespaces authentication helpers provide.
 
@@ -106,5 +104,4 @@ gh cs ssh -c "$codespace" -- -L local_port:localhost:remote_port -N
 
 ## Limitations
 
-- Currently requires `socat` for Unix socket proxying
 - Authentication is tied to your local Azure CLI session
