@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+# Define cleanup function to handle termination
+cleanup() {
+  # Clean up SSH connection running socat if it exists
+  if [ -n "$SOCAT_SSH_PID" ]; then
+    echo "Cleaning up socat SSH connection (PID: $SOCAT_SSH_PID)..."
+    kill $SOCAT_SSH_PID 2>/dev/null || true
+    wait $SOCAT_SSH_PID 2>/dev/null || true
+    echo "Socat SSH connection terminated"
+  fi
+
+  # Clean up by killing the auth service process
+  if [ -n "$ADO_AUTH_SERVICE_PID" ]; then
+    echo "Stopping ado-auth-service (PID: $ADO_AUTH_SERVICE_PID)..."
+    kill $ADO_AUTH_SERVICE_PID 2>/dev/null || true
+    wait $ADO_AUTH_SERVICE_PID 2>/dev/null || true
+    echo "ado-auth-service stopped"
+  fi
+}
+
+# Set up trap to ensure cleanup happens on exit
+trap cleanup EXIT INT TERM
+
+# Start the ado-auth-service in the background
+auth_service="$(dirname "$0")"/apps/ado-auth-service
+echo "Starting ado-auth-service in the background..."
+node "$auth_service" &
+ADO_AUTH_SERVICE_PID=$!
+
+echo "ado-auth-service started with PID: $ADO_AUTH_SERVICE_PID"
+codespace=$(gh cs ls | fzf | awk '{print $1}')
+echo "Selected codespace: $codespace"
+
+# Generate a unique socket ID for this session
+SOCKET_ID=$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')
+SOCKET_PATH="/tmp/ado-auth-${SOCKET_ID}.sock"
+
+# Start a dedicated SSH connection to run socat continuously
+echo "Starting dedicated SSH connection for socat..."
+gh cs ssh -c "$codespace" -- -R 9000:localhost:9000 "socat UNIX-LISTEN:$SOCKET_PATH,fork TCP:localhost:9000" &
+SOCAT_SSH_PID=$!
+
+# Wait a moment for socat to start
+echo "Socat started in dedicated SSH connection with PID: $SOCAT_SSH_PID"
+
+# Start an interactive SSH session (no need to forward port again)
+echo "Starting interactive SSH session..."
+gh cs ssh -c "$codespace" -- -t

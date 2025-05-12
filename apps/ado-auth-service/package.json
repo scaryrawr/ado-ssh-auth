@@ -1,0 +1,26 @@
+{
+  "name": "ado-auth-service",
+  "packageManager": "yarn@4.6.0",
+  "main": "lib/index.js",
+  "scripts": {
+    "lint": "eslint .",
+    "transpile": "tsc -p tsconfig.json --isolatedModules",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.26.0",
+    "@types/eslint": "^9.6.1",
+    "@types/node": "^22.15.17",
+    "@types/node-ipc": "^9.2.3",
+    "@types/uuid": "^10.0.0",
+    "eslint": "^9.26.0",
+    "globals": "^16.1.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.32.0"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.9.1",
+    "node-ipc": "^9",
+    "uuid": "^11.1.0"
+  }
+}
