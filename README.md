@@ -35,7 +35,13 @@ This tool does not *yet* provide the ado-auth-helper script, so initial configur
 
 ## Usage
 
-Simply run the `ado-gh-session` script to start a session:
+Make sure to use the Azure CLI to login and setup to be able to request access tokens:
+
+```bash
+az login --scope 499b84ac-1321-427f-aa17-267ca6975798/.default
+```
+
+Then, run the `ado-gh-session` script to start a session:
 
 ```bash
 ./ado-gh-session
