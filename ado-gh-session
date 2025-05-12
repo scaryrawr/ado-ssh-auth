@@ -33,7 +33,7 @@ codespace=$(gh cs ls | fzf | awk '{print $1}')
 echo "Selected codespace: $codespace"
 
 # Generate a unique socket ID for this session
-SOCKET_ID=$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')
+SOCKET_ID=$(uuidgen)
 SOCKET_PATH="/tmp/ado-auth-${SOCKET_ID}.sock"
 
 # Start a dedicated SSH connection to run socat continuously
@@ -46,4 +46,4 @@ echo "Socat started in dedicated SSH connection with PID: $SOCAT_SSH_PID"
 
 # Start an interactive SSH session (no need to forward port again)
 echo "Starting interactive SSH session..."
-gh cs ssh -c "$codespace" -- -t
+TERM=xterm-256color gh cs ssh -c "$codespace" -- -t
