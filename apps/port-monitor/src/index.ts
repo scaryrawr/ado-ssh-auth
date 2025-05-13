@@ -23,6 +23,16 @@ type MonitorEvent = PortEvent | ErrorEvent;
 const boundPorts = new Set<string>();
 
 /**
+ * Check if a port should be monitored
+ * @param port The port number to check
+ * @returns True if the port should be monitored, false otherwise
+ */
+function shouldMonitorPort(port: number): boolean {
+  // Filter out well-known ports (0-1023)
+  return port > 1023;
+}
+
+/**
  * Send a message to stdout in JSON format
  * @param event The event to send
  */
@@ -137,8 +147,8 @@ function startMonitoring(): void {
       if (portInfo) {
         const { port, protocol, key } = portInfo;
 
-        // If this is a new port, send a 'bound' event
-        if (!boundPorts.has(key)) {
+        // If this is a new port and not a well-known port, send a 'bound' event
+        if (!boundPorts.has(key) && shouldMonitorPort(port)) {
           boundPorts.add(key);
           sendMessage({
             type: "port",
@@ -232,7 +242,7 @@ async function checkForUnboundPorts(): Promise<void> {
 
       rl.on("line", (line) => {
         const portInfo = parsePortInfo(line);
-        if (portInfo) {
+        if (portInfo && shouldMonitorPort(portInfo.port)) {
           currentPorts.add(portInfo.key);
         }
       });
@@ -249,14 +259,17 @@ async function checkForUnboundPorts(): Promise<void> {
 
             const port = parseInt(portStr, 10);
 
-            // Send unbound event
-            sendMessage({
-              type: "port",
-              action: "unbound",
-              port,
-              protocol: protocol as "tcp" | "udp",
-              timestamp: new Date().toISOString(),
-            });
+            // Only report unbound events for non-well-known ports
+            if (shouldMonitorPort(port)) {
+              // Send unbound event
+              sendMessage({
+                type: "port",
+                action: "unbound",
+                port,
+                protocol: protocol as "tcp" | "udp",
+                timestamp: new Date().toISOString(),
+              });
+            }
 
             // Remove from tracked ports
             boundPorts.delete(key);
