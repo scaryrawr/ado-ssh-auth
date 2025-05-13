@@ -4,26 +4,13 @@
 cleanup() {
   # Clean up port forwarding connections
   if [ -n "$PORT_FORWARD_PIDS" ]; then
-    echo "Cleaning up port forwarding monitor processes..."
+    echo "Cleaning up port forwarding manager processes..." # Changed "monitor" to "manager"
     for pid in $PORT_FORWARD_PIDS; do
-      echo "Killing port forward monitor process (PID: $pid)..."
+      echo "Killing port forward manager process (PID: $pid)..." # Changed "monitor" to "manager"
       kill $pid 2>/dev/null || true
       wait $pid 2>/dev/null || true
     done
-    echo "Port forwarding monitor processes terminated"
-  fi
-  
-  # Clean up individual port forwarding processes
-  if [ -f "/tmp/port-forwards-$SOCKET_ID" ]; then
-    echo "Cleaning up port forwarding connections..."
-    while read -r line; do
-      port=$(echo "$line" | cut -d':' -f1)
-      pid=$(echo "$line" | cut -d':' -f2)
-      echo "Killing port forward for port $port (PID: $pid)..."
-      kill $pid 2>/dev/null || true
-    done < "/tmp/port-forwards-$SOCKET_ID"
-    rm -f "/tmp/port-forwards-$SOCKET_ID"
-    echo "All port forwarding connections terminated"
+    echo "Port forwarding manager processes terminated"
   fi
 
   # Clean up by killing the auth service process
@@ -48,108 +35,102 @@ cleanup() {
   fi
   
   # Clean up temporary files
-  rm -f "/tmp/port-monitor-errors-$SOCKET_ID.log" 2>/dev/null || true
+  rm -f "/tmp/port-monitor-errors-${codespace}-${SOCKET_ID}.log" 2>/dev/null || true
+  # rm -f "/tmp/port-forwarding-subshell-${codespace}-${SOCKET_ID}.log" 2>/dev/null || true # Old log, no longer used
+  if [ -n "$PORT_FORWARD_MANAGER_LOG_FILE" ]; then # Check if var is set before trying to rm
+    rm -f "$PORT_FORWARD_MANAGER_LOG_FILE" 2>/dev/null || true
+  fi
 }
 
 # Set up trap to ensure cleanup happens on exit
 trap cleanup EXIT INT TERM
 
+# Generate a unique socket ID for this session early, as it's used by FIFO and PID files
+SOCKET_ID=$(uuidgen)
+SOCKET_PATH="/tmp/ado-auth-${SOCKET_ID}.sock"
+
 # Start the ado-auth-service in the background
-auth_service="$(dirname "$0")"/apps/ado-auth-service
-echo "Starting ado-auth-service in the background..."
-node "$auth_service" &
+auth_service_dir_path="$(dirname "$0")"/apps/ado-auth-service # Renamed for clarity
+echo "Starting ado-auth-service in the background from $auth_service_dir_path..."
+# Check if package.json exists, which implies it can be run with just the directory path by Node
+if [ ! -f "$auth_service_dir_path/package.json" ]; then
+  echo "Error: ado-auth-service package.json not found at $auth_service_dir_path/package.json" >&2
+  echo "Cannot start service without ado-auth-service package." >&2
+  exit 1
+fi
+
+node "$auth_service_dir_path" &
 ADO_AUTH_SERVICE_PID=$!
 
 echo "ado-auth-service started with PID: $ADO_AUTH_SERVICE_PID"
+
 codespace=$(gh cs ls | fzf | awk '{print $1}')
+if [ -z "$codespace" ]; then
+  echo "No codespace selected or fzf cancelled. Exiting." >&2
+  exit 1
+fi
 echo "Selected codespace: $codespace"
+export codespace # Export for use in subshells like the port forwarding monitor
 
 # Copy the port-monitor to remote machine
 port_monitor="$(dirname "$0")"/apps/port-monitor
 
 # Copy the port-monitor to the remote machine
 echo "Copying port-monitor to remote machine..."
-gh cs cp -c "$codespace" -e "$port_monitor/lib/index.js" 'remote:~/port-monitor.js'
+if ! gh cs cp -c "$codespace" -e "$port_monitor/lib/index.js" 'remote:~/port-monitor.js'; then
+  echo "Failed to copy port-monitor to remote machine. Exiting." >&2
+  exit 1
+fi
 
 # Create a named pipe for port monitor communication
 PORT_MONITOR_FIFO="/tmp/port-monitor-fifo-$SOCKET_ID"
 rm -f "$PORT_MONITOR_FIFO"
-mkfifo "$PORT_MONITOR_FIFO"
+if ! mkfifo "$PORT_MONITOR_FIFO"; then
+  echo "Failed to create named pipe $PORT_MONITOR_FIFO. Exiting." >&2
+  exit 1
+fi
 
-# Function to forward a port
-forward_port() {
-  local port=$1
-  local process_name="port-forward-$port"
-  
-  echo "Setting up port forwarding for port $port..."
-  
-  # Check if we're already forwarding this port
-  if [[ "$PORT_FORWARD_LIST" == *"$port"* ]]; then
-    echo "Port $port is already being forwarded"
-    return
-  fi
-  
-  # Start a detached SSH process for port forwarding
-  (
-    # Run in a subshell with its own process group
-    setsid sh -c "exec gh cs ssh -c \"$codespace\" -- -N -L $port:localhost:$port > /dev/null 2>&1" &
-    echo "$port:$!" >> "/tmp/port-forwards-$SOCKET_ID"
-  )
-  
-  # Add to our tracking list
-  PORT_FORWARD_LIST="$PORT_FORWARD_LIST $port"
-  echo "Port $port forwarding established"
-}
+# Initialize the file to track port forwarding processes globally and set permissions
+# This should be done after SOCKET_ID is defined
+if [ -z "$SOCKET_ID" ]; then
+  echo "Error: SOCKET_ID is not defined. Exiting." >&2
+  exit 1
+fi
+PORT_FORWARDS_PID_FILE="/tmp/port-forwards-$SOCKET_ID"
+rm -f "$PORT_FORWARDS_PID_FILE"
+touch "$PORT_FORWARDS_PID_FILE"
+chmod 600 "$PORT_FORWARDS_PID_FILE"
 
-# Start a background process to monitor the named pipe and establish port forwarding
-(
-  PORT_FORWARD_PIDS=""
-  PORT_FORWARD_LIST=""
-  
-  # Create a file to track port forwarding processes
-  rm -f "/tmp/port-forwards-$SOCKET_ID"
-  touch "/tmp/port-forwards-$SOCKET_ID"
-  
-  echo "Port forwarding monitor started"
-  
-  while read -r line; do
-    # Process JSON output from port-monitor
-    if echo "$line" | jq -e '. | select(.type == "port" and .action == "bound")' > /dev/null; then
-      # Extract port from the JSON
-      port=$(echo "$line" | jq -r .port)
-      protocol=$(echo "$line" | jq -r .protocol)
-      
-      # Only handle TCP ports for now
-      if [ "$protocol" = "tcp" ]; then
-        echo "Detected new port bound: $port"
-        forward_port "$port"
-      fi
-    elif echo "$line" | jq -e '. | select(.type == "error")' > /dev/null; then
-      # Log errors from the port monitor
-      message=$(echo "$line" | jq -r .message)
-      echo "Port monitor error: $message" >&2
-    fi
-  done < "$PORT_MONITOR_FIFO" &
-  
-  # Keep track of this background process
-  PORT_FORWARD_MONITOR_PID=$!
-  echo "Port forwarding monitor PID: $PORT_FORWARD_MONITOR_PID"
-  
-  # Add to cleanup
-  PORT_FORWARD_PIDS="$PORT_FORWARD_MONITOR_PID"
-) &
+# Start the new port forwarding manager script
+PORT_FORWARD_MANAGER_LOG_FILE="/tmp/port-forward-manager-${codespace}-${SOCKET_ID}.log"
+port_forward_manager_script_path="$(dirname "$0")"/port-forward-manager
+
+if [ ! -f "$port_forward_manager_script_path" ]; then
+  echo "Error: Port forward manager script not found at $port_forward_manager_script_path" >&2
+  exit 1
+fi
+if [ ! -x "$port_forward_manager_script_path" ]; then
+  echo "Error: Port forward manager script at $port_forward_manager_script_path is not executable." >&2
+  exit 1
+fi
+
+echo "Starting port forwarding manager script: $port_forward_manager_script_path..."
+"$port_forward_manager_script_path" "$PORT_MONITOR_FIFO" "$PORT_FORWARDS_PID_FILE" "$codespace" "$PORT_FORWARD_MANAGER_LOG_FILE" &
+PORT_FORWARD_MANAGER_PID=$!
+echo "Port forwarding manager script started with PID: $PORT_FORWARD_MANAGER_PID. Log: $PORT_FORWARD_MANAGER_LOG_FILE"
+
+
+# This ensures the main cleanup function can terminate the port forwarding manager script.
+PORT_FORWARD_PIDS="$PORT_FORWARD_MANAGER_PID"
 
 # Start the port monitor on the remote machine and pipe output to the FIFO
 echo "Starting port-monitor on remote machine..."
-gh cs ssh -c "$codespace" -- "node \$HOME/port-monitor.js" > "$PORT_MONITOR_FIFO" 2> /tmp/port-monitor-errors-$SOCKET_ID.log &
+REMOTE_PORT_MONITOR_ERROR_LOG="/tmp/port-monitor-errors-${codespace}-${SOCKET_ID}.log" # Updated log name
+gh cs ssh -c "$codespace" -- "node \$HOME/port-monitor.js" > "$PORT_MONITOR_FIFO" 2> "$REMOTE_PORT_MONITOR_ERROR_LOG" &
 PORT_MONITOR_PID=$!
 
 # Wait a moment for port monitor to initialize
-echo "Port monitor started with PID: $PORT_MONITOR_PID"
-
-# Generate a unique socket ID for this session
-SOCKET_ID=$(uuidgen)
-SOCKET_PATH="/tmp/ado-auth-${SOCKET_ID}.sock"
+echo "Port monitor started with PID: $PORT_MONITOR_PID. Errors will be logged to $REMOTE_PORT_MONITOR_ERROR_LOG on the local machine after sync (if any)." # Clarified error log location
 
 # Start an interactive SSH session (no need to forward port again)
 echo "Starting interactive SSH session..."
