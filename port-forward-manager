@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+
+# Script to manage port forwarding for a given codespace session.
+# This script is intended to be run in the background.
+
+# Parameters:
+# $1: PORT_MONITOR_FIFO - Named pipe to read port events from.
+# $2: PORT_FORWARDS_PID_FILE - File to store PIDs of forwarded ports.
+# $3: CODESPACE_NAME - The name of the codespace to forward ports to.
+# $4: LOG_FILE - File to write logs to.
+
+PORT_MONITOR_FIFO="$1"
+PORT_FORWARDS_PID_FILE="$2"
+CODESPACE_NAME="$3"
+LOG_FILE="$4"
+
+# Ensure all parameters are provided
+if [ -z "$PORT_MONITOR_FIFO" ] || [ -z "$PORT_FORWARDS_PID_FILE" ] || [ -z "$CODESPACE_NAME" ] || [ -z "$LOG_FILE" ]; then
+  echo "Usage: $0 <port_monitor_fifo> <port_forwards_pid_file> <codespace_name> <log_file>" >&2
+  exit 1
+fi
+
+# Redirect all output from this script to the specified log file
+exec > "$LOG_FILE" 2>&1
+
+echo "Port Forwarding Manager (PFM PID: $$) started."
+echo "PFM: Reading port events from: $PORT_MONITOR_FIFO"
+echo "PFM: PID file for forwarded ports: $PORT_FORWARDS_PID_FILE"
+echo "PFM: Target codespace: $CODESPACE_NAME"
+echo "PFM: Logging to: $LOG_FILE"
+
+# Function to clean up all spawned port forwarding processes
+cleanup_individual_forwards() {
+  echo "PFM: cleanup_individual_forwards triggered."
+  if [ ! -f "$PORT_FORWARDS_PID_FILE" ]; then
+    echo "PFM: PID file '$PORT_FORWARDS_PID_FILE' not found. No individual forwards to clean up."
+    return
+  fi
+
+  echo "PFM: Cleaning up PIDs from '$PORT_FORWARDS_PID_FILE'..."
+  # Use a unique temporary file for reading, to avoid issues if the main file is modified or during errors.
+  local temp_pid_file_copy="${PORT_FORWARDS_PID_FILE}.toclean.$$"
+  
+  cp "$PORT_FORWARDS_PID_FILE" "$temp_pid_file_copy"
+  if [ ! -f "$temp_pid_file_copy" ]; then
+    echo "PFM: ERROR - Failed to copy PID file for cleanup. Original: '$PORT_FORWARDS_PID_FILE'." >&2
+    # As a last resort, try to remove the original if it exists, as it might be empty or corrupt.
+    if [ -f "$PORT_FORWARDS_PID_FILE" ]; then
+        echo "PFM: Removing original PID file '$PORT_FORWARDS_PID_FILE' as fallback due to copy error."
+        rm -f "$PORT_FORWARDS_PID_FILE"
+    fi
+    return 1 # Indicate error
+  fi
+  
+  local pids_killed_count=0
+  local line port pid
+  while IFS= read -r line; do
+    # Skip empty lines
+    [ -z "$line" ] && continue
+    port=$(echo "$line" | cut -d':' -f1)
+    pid=$(echo "$line" | cut -d':' -f2)
+    if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then # Check if PID is a positive number
+      echo "PFM: Killing forward for port $port (PID: $pid)..."
+      kill "$pid" 2>/dev/null || true # Send SIGTERM
+      # Optionally, wait a very short moment and send SIGKILL if still alive
+      # For now, simple kill and wait
+      wait "$pid" 2>/dev/null || true # Wait for the process to actually terminate
+      pids_killed_count=$((pids_killed_count + 1))
+    elif [ -n "$pid" ]; then
+      echo "PFM: Invalid PID '$pid' found for port '$port' in PID file. Skipping." >&2
+    fi
+  done < "$temp_pid_file_copy"
+  
+  rm -f "$temp_pid_file_copy" # Clean up the temporary copy
+  echo "PFM: $pids_killed_count PIDs processed for termination from copy."
+
+  echo "PFM: Removing main PID file '$PORT_FORWARDS_PID_FILE'."
+  rm -f "$PORT_FORWARDS_PID_FILE"
+  echo "PFM: Individual forwards cleanup complete."
+}
+
+# Set up traps to call cleanup_individual_forwards on script exit/interrupt/termination
+# Using single quotes for the command string ensures 'cleanup_individual_forwards' is called literally.
+# For INT and TERM, we also explicitly exit with a status code indicating the signal.
+trap 'echo "PFM: EXIT signal received, running cleanup..."; cleanup_individual_forwards' EXIT
+trap 'echo "PFM: INT signal received, running cleanup..."; cleanup_individual_forwards; exit 130' INT # 128 + 2 (SIGINT)
+trap 'echo "PFM: TERM signal received, running cleanup..."; cleanup_individual_forwards; exit 143' TERM # 128 + 15 (SIGTERM)
+
+# Local list for this script to track which ports it *thinks* it's forwarding.
+# The ground truth for PIDs is PORT_FORWARDS_PID_FILE.
+PORT_FORWARD_LIST=""
+
+# Function to forward a port
+forward_port() {
+  local port_to_forward=$1
+
+  echo "PFM: Checking to forward port $port_to_forward..."
+
+  # Check local list first (optimization, but PID file is ground truth)
+  if [[ " $PORT_FORWARD_LIST " == *"$port_to_forward"* ]]; then
+    echo "PFM: Port $port_to_forward is already in the local forward list."
+    # Verify with PID file to be sure
+    if grep -q "^$port_to_forward:" "$PORT_FORWARDS_PID_FILE" 2>/dev/null; then
+        echo "PFM: Port $port_to_forward also found in PID file. No action needed."
+        return 0
+    else
+        echo "PFM: Port $port_to_forward was in local list but NOT in PID file. List stale. Attempting to forward."
+        PORT_FORWARD_LIST=$(echo " $PORT_FORWARD_LIST " | sed "s/ $port_to_forward / /g" | xargs) # Remove from stale list
+    fi
+  fi
+
+  # Double check against the PID file to prevent duplicate gh processes
+  if grep -q "^$port_to_forward:" "$PORT_FORWARDS_PID_FILE" 2>/dev/null; then
+    echo "PFM: Port $port_to_forward is already being forwarded (found in $PORT_FORWARDS_PID_FILE). Adding to local list if missing."
+    if [[ ! " $PORT_FORWARD_LIST " == *"$port_to_forward"* ]]; then
+        PORT_FORWARD_LIST="$PORT_FORWARD_LIST $port_to_forward"
+        PORT_FORWARD_LIST=$(echo "$PORT_FORWARD_LIST" | xargs) # Normalize spaces
+    fi
+    return 0
+  fi
+  
+  echo "PFM: Setting up port forwarding for port $port_to_forward..."
+  # Start SSH process for port forwarding in the background
+  # Ensure no interactive prompts from gh, though -N should prevent most.
+  gh cs ssh -c "$CODESPACE_NAME" -- -N -L "$port_to_forward:localhost:$port_to_forward" > /dev/null 2>&1 &
+  local forward_pid=$!
+
+  # Brief pause to allow the process to potentially fail quickly or establish
+  sleep 0.5 
+
+  if kill -0 "$forward_pid" 2>/dev/null; then
+    # Process is alive, record it
+    echo "$port_to_forward:$forward_pid" >> "$PORT_FORWARDS_PID_FILE"
+    echo "PFM: Port $port_to_forward forwarding initiated (PID: $forward_pid). Entry added to $PORT_FORWARDS_PID_FILE."
+    
+    PORT_FORWARD_LIST="$PORT_FORWARD_LIST $port_to_forward"
+    PORT_FORWARD_LIST=$(echo "$PORT_FORWARD_LIST" | xargs) 
+    echo "PFM: Port $port_to_forward added to local list. Current list: '$PORT_FORWARD_LIST'"
+    return 0
+  else
+    echo "PFM: ERROR - Failed to start port forwarding for port $port_to_forward (PID: $forward_pid did not start or exited quickly)." >&2
+    # Attempt to get error from gh if possible (difficult with backgrounding like this)
+    return 1 # Indicate failure
+  fi
+}
+
+# Function to stop forwarding a port
+stop_forwarding_port() {
+  local port_to_stop=$1
+  local temp_rewrite_pid_file="${PORT_FORWARDS_PID_FILE}.tmpstop.$$" # Unique temp file for rewriting
+  local found_port_to_kill=0
+
+  echo "PFM: Attempting to stop port forwarding for port $port_to_stop..."
+
+  if [ ! -f "$PORT_FORWARDS_PID_FILE" ]; then
+    echo "PFM: Port forwards PID file ($PORT_FORWARDS_PID_FILE) does not exist. Nothing to stop for port $port_to_stop."
+    # If it wasn't in the PID file, ensure it's not in the local list either (defensive)
+    if [[ " $PORT_FORWARD_LIST " == *" $port_to_stop "* ]]; then
+        echo "PFM: Port $port_to_stop was in local list but PID file is missing. Removing from stale list."
+        PORT_FORWARD_LIST=$(echo " $PORT_FORWARD_LIST " | sed "s/ $port_to_stop / /g" | xargs)
+    fi
+    return
+  fi
+
+  # Create the temp file for rewriting the PID file
+  touch "$temp_rewrite_pid_file" 
+  chmod 600 "$temp_rewrite_pid_file"
+
+  local line_read current_port_in_file pid_to_kill
+  while IFS= read -r line_read; do
+    # Skip empty lines
+    [ -z "$line_read" ] && continue
+    current_port_in_file=$(echo "$line_read" | cut -d':' -f1)
+    pid_to_kill=$(echo "$line_read" | cut -d':' -f2)
+
+    if [ "$current_port_in_file" = "$port_to_stop" ]; then
+      if [ -n "$pid_to_kill" ] && [ "$pid_to_kill" -gt 0 ] 2>/dev/null; then # Check if PID is a positive number
+        echo "PFM: Stopping port forward for port $current_port_in_file (PID: $pid_to_kill)..."
+        kill "$pid_to_kill" 2>/dev/null || true 
+        wait "$pid_to_kill" 2>/dev/null || true # Wait for the process to actually terminate
+        found_port_to_kill=1
+        echo "PFM: Port forwarding for $current_port_in_file (PID: $pid_to_kill) stopped."
+      else
+        echo "PFM: Warning - Found port $current_port_in_file in PID file but PID '$pid_to_kill' was invalid/empty. Removing entry." >&2
+        found_port_to_kill=1 # Mark as found to ensure it's removed from PID file and local list
+      fi
+    else
+      # Keep other entries
+      echo "$line_read" >> "$temp_rewrite_pid_file"
+    fi
+  done < "$PORT_FORWARDS_PID_FILE"
+
+  # Atomically replace the old PID file with the new one
+  if ! mv "$temp_rewrite_pid_file" "$PORT_FORWARDS_PID_FILE"; then
+    echo "PFM: ERROR - Failed to move temp PID file '$temp_rewrite_pid_file' to '$PORT_FORWARDS_PID_FILE'." >&2
+    rm -f "$temp_rewrite_pid_file" # Clean up temp file if mv failed
+  fi
+  # If mv succeeds, temp_rewrite_pid_file is gone.
+
+  if [ "$found_port_to_kill" -eq 1 ]; then
+    PORT_FORWARD_LIST=$(echo " $PORT_FORWARD_LIST " | sed "s/ $port_to_stop / /g" | xargs)
+    echo "PFM: Port $port_to_stop processed for removal from local list. Current list: '$PORT_FORWARD_LIST'"
+  else
+    echo "PFM: No active port forwarding PID found for port $port_to_stop in the PID file." # Corrected the unterminated string
+    # If it wasn't in the PID file, ensure it's not in the list either (defensive)
+    if [[ " $PORT_FORWARD_LIST " == *" $port_to_stop "* ]]; then
+        echo "PFM: Port $port_to_stop was in local list but not PID file. Removing from stale list."
+        PORT_FORWARD_LIST=$(echo " $PORT_FORWARD_LIST " | sed "s/ $port_to_stop / /g" | xargs)
+    fi
+  fi
+}
+
+# Main loop: Read from the port monitor FIFO and act on events
+echo "PFM: Entering main loop. Waiting for port events from $PORT_MONITOR_FIFO..."
+# Ensure the FIFO exists before trying to read from it in a loop
+if [ ! -p "$PORT_MONITOR_FIFO" ]; then
+    echo "PFM: ERROR - FIFO '$PORT_MONITOR_FIFO' does not exist or is not a FIFO. Exiting." >&2
+    exit 1 # The EXIT trap will handle cleanup
+fi
+
+while IFS= read -r line || [ -n "$line" ]; do # Process last line if no newline
+  if [ -z "$line" ]; then 
+      if [ ! -p "$PORT_MONITOR_FIFO" ]; then
+          echo "PFM: FIFO '$PORT_MONITOR_FIFO' disappeared. Exiting loop." >&2
+          break
+      fi
+      sleep 0.1 
+      continue
+  fi
+
+  echo "PFM: Received line from FIFO: [$line]"
+
+  if ! echo "$line" | jq -e . > /dev/null 2>&1; then
+      echo "PFM: Received non-JSON line: [$line]" >&2
+      continue
+  fi
+
+  type=$(echo "$line" | jq -r .type)
+  action=$(echo "$line" | jq -r .action)
+  port_json=$(echo "$line" | jq -r .port)
+  protocol=$(echo "$line" | jq -r .protocol)
+  
+  if [ "$type" = "port" ] && [ "$protocol" = "tcp" ]; then
+    if [ "$action" = "bound" ]; then
+      echo "PFM: Detected new TCP port bound: $port_json"
+      forward_port "$port_json"
+    elif [ "$action" = "unbound" ]; then
+      echo "PFM: Detected TCP port unbound: $port_json"
+      stop_forwarding_port "$port_json"
+    fi
+  elif [ "$type" = "error" ]; then
+    message=$(echo "$line" | jq -r .message)
+    # Correctly quote the command substitution for the date fallback
+    timestamp=$(echo "$line" | jq -r .timestamp // "$(date -u +%Y-%m-%dT%H:%M:%SZ)") 
+    # In POSIX sh, echo does not require escaping for literal parentheses in strings.
+    # However, if issues persist, one might use printf or ensure no special shell interpretation.
+    echo "PFM: Port monitor error ($timestamp): $message" >&2
+  elif [ "$type" = "port" ] && [ "$protocol" != "tcp" ]; then
+    : # Ignoring non-TCP port events silently
+  else
+    echo "PFM: Unrecognized event from port-monitor: $line" >&2
+  fi # This fi closes the if [ "$type" = "port" ] && [ "$protocol" = "tcp" ] block
+
+done < "$PORT_MONITOR_FIFO"
+
+echo "PFM: Main loop finished (FIFO closed or unreadable). Script will now exit."
+# The EXIT trap (defined above) will automatically call cleanup_individual_forwards.

@@ -2,6 +2,17 @@
 
 # Define cleanup function to handle termination
 cleanup() {
+  # Clean up port forwarding connections
+  if [ -n "$PORT_FORWARD_PIDS" ]; then
+    echo "Cleaning up port forwarding manager processes..." # Changed "monitor" to "manager"
+    for pid in $PORT_FORWARD_PIDS; do
+      echo "Killing port forward manager process (PID: $pid)..." # Changed "monitor" to "manager"
+      kill $pid 2>/dev/null || true
+      wait $pid 2>/dev/null || true
+    done
+    echo "Port forwarding manager processes terminated"
+  fi
+
   # Clean up by killing the auth service process
   if [ -n "$ADO_AUTH_SERVICE_PID" ]; then
     echo "Stopping ado-auth-service (PID: $ADO_AUTH_SERVICE_PID)..."
@@ -9,25 +20,120 @@ cleanup() {
     wait $ADO_AUTH_SERVICE_PID 2>/dev/null || true
     echo "ado-auth-service stopped"
   fi
+
+  # Clean up by killing the port monitor process
+  if [ -n "$PORT_MONITOR_PID" ]; then
+    echo "Stopping port-monitor (PID: $PORT_MONITOR_PID)..."
+    kill $PORT_MONITOR_PID 2>/dev/null || true
+    wait $PORT_MONITOR_PID 2>/dev/null || true
+    echo "port-monitor stopped"
+  fi
+  
+  # Clean up named pipe
+  if [ -p "$PORT_MONITOR_FIFO" ]; then
+    rm -f "$PORT_MONITOR_FIFO"
+  fi
+  
+  # Clean up temporary files
+  rm -f "/tmp/port-monitor-errors-${codespace}-${SOCKET_ID}.log" 2>/dev/null || true
+  # rm -f "/tmp/port-forwarding-subshell-${codespace}-${SOCKET_ID}.log" 2>/dev/null || true # Old log, no longer used
+  if [ -n "$PORT_FORWARD_MANAGER_LOG_FILE" ]; then # Check if var is set before trying to rm
+    rm -f "$PORT_FORWARD_MANAGER_LOG_FILE" 2>/dev/null || true
+  fi
 }
 
 # Set up trap to ensure cleanup happens on exit
 trap cleanup EXIT INT TERM
 
-# Start the ado-auth-service in the background
-auth_service="$(dirname "$0")"/apps/ado-auth-service
-echo "Starting ado-auth-service in the background..."
-node "$auth_service" &
-ADO_AUTH_SERVICE_PID=$!
-
-echo "ado-auth-service started with PID: $ADO_AUTH_SERVICE_PID"
-codespace=$(gh cs ls | fzf | awk '{print $1}')
-echo "Selected codespace: $codespace"
-
-# Generate a unique socket ID for this session
+# Generate a unique socket ID for this session early, as it's used by FIFO and PID files
 SOCKET_ID=$(uuidgen)
 SOCKET_PATH="/tmp/ado-auth-${SOCKET_ID}.sock"
 
+# Start the ado-auth-service in the background
+auth_service_dir_path="$(dirname "$0")"/apps/ado-auth-service # Renamed for clarity
+echo "Starting ado-auth-service in the background from $auth_service_dir_path..."
+# Check if package.json exists, which implies it can be run with just the directory path by Node
+if [ ! -f "$auth_service_dir_path/package.json" ]; then
+  echo "Error: ado-auth-service package.json not found at $auth_service_dir_path/package.json" >&2
+  echo "Cannot start service without ado-auth-service package." >&2
+  exit 1
+fi
+
+node "$auth_service_dir_path" &
+ADO_AUTH_SERVICE_PID=$!
+
+echo "ado-auth-service started with PID: $ADO_AUTH_SERVICE_PID"
+
+codespace=$(gh cs ls | fzf | awk '{print $1}')
+if [ -z "$codespace" ]; then
+  echo "No codespace selected or fzf cancelled. Exiting." >&2
+  exit 1
+fi
+echo "Selected codespace: $codespace"
+export codespace # Export for use in subshells like the port forwarding monitor
+
+# Copy the port-monitor to remote machine
+port_monitor="$(dirname "$0")"/apps/port-monitor
+
+# Copy the port-monitor to the remote machine
+echo "Copying port-monitor to remote machine..."
+if ! gh cs cp -c "$codespace" -e "$port_monitor/lib/index.js" 'remote:~/port-monitor.js'; then
+  echo "Failed to copy port-monitor to remote machine. Exiting." >&2
+  exit 1
+fi
+
+# Create a named pipe for port monitor communication
+PORT_MONITOR_FIFO="/tmp/port-monitor-fifo-$SOCKET_ID"
+rm -f "$PORT_MONITOR_FIFO"
+if ! mkfifo "$PORT_MONITOR_FIFO"; then
+  echo "Failed to create named pipe $PORT_MONITOR_FIFO. Exiting." >&2
+  exit 1
+fi
+
+# Initialize the file to track port forwarding processes globally and set permissions
+# This should be done after SOCKET_ID is defined
+if [ -z "$SOCKET_ID" ]; then
+  echo "Error: SOCKET_ID is not defined. Exiting." >&2
+  exit 1
+fi
+PORT_FORWARDS_PID_FILE="/tmp/port-forwards-$SOCKET_ID"
+rm -f "$PORT_FORWARDS_PID_FILE"
+touch "$PORT_FORWARDS_PID_FILE"
+chmod 600 "$PORT_FORWARDS_PID_FILE"
+
+# Start the new port forwarding manager script
+PORT_FORWARD_MANAGER_LOG_FILE="/tmp/port-forward-manager-${codespace}-${SOCKET_ID}.log"
+port_forward_manager_script_path="$(dirname "$0")"/port-forward-manager
+
+if [ ! -f "$port_forward_manager_script_path" ]; then
+  echo "Error: Port forward manager script not found at $port_forward_manager_script_path" >&2
+  exit 1
+fi
+if [ ! -x "$port_forward_manager_script_path" ]; then
+  echo "Error: Port forward manager script at $port_forward_manager_script_path is not executable." >&2
+  exit 1
+fi
+
+echo "Starting port forwarding manager script: $port_forward_manager_script_path..."
+"$port_forward_manager_script_path" "$PORT_MONITOR_FIFO" "$PORT_FORWARDS_PID_FILE" "$codespace" "$PORT_FORWARD_MANAGER_LOG_FILE" &
+PORT_FORWARD_MANAGER_PID=$!
+echo "Port forwarding manager script started with PID: $PORT_FORWARD_MANAGER_PID. Log: $PORT_FORWARD_MANAGER_LOG_FILE"
+
+
+# This ensures the main cleanup function can terminate the port forwarding manager script.
+PORT_FORWARD_PIDS="$PORT_FORWARD_MANAGER_PID"
+
+# Start the port monitor on the remote machine and pipe output to the FIFO
+echo "Starting port-monitor on remote machine..."
+REMOTE_PORT_MONITOR_ERROR_LOG="/tmp/port-monitor-errors-${codespace}-${SOCKET_ID}.log" # Updated log name
+gh cs ssh -c "$codespace" -- "node \$HOME/port-monitor.js" > "$PORT_MONITOR_FIFO" 2> "$REMOTE_PORT_MONITOR_ERROR_LOG" &
+PORT_MONITOR_PID=$!
+
+# Wait a moment for port monitor to initialize
+echo "Port monitor started with PID: $PORT_MONITOR_PID. Errors will be logged to $REMOTE_PORT_MONITOR_ERROR_LOG on the local machine after sync (if any)." # Clarified error log location
+
 # Start an interactive SSH session (no need to forward port again)
 echo "Starting interactive SSH session..."
+echo "Any ports opened on the remote machine will be automatically forwarded to your local machine."
+
 TERM=xterm-256color gh cs ssh -c "$codespace" -- -R "$SOCKET_PATH:localhost:9000" -t

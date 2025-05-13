@@ -4,6 +4,20 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "yarn: build - port-monitor",
+      "type": "shell",
+      "command": "yarn",
+      "args": [
+        "build",
+        "--to",
+        "port-monitor"
+      ],
+      "group": "build",
+      "problemMatcher": [
+        "$tsc"
+      ]
+    },
+    {
       "label": "yarn: build - ado-auth-service",
       "type": "shell",
       "command": "yarn",
@@ -11,6 +25,14 @@
         "build",
         "--to",
         "ado-auth-service"
+      ],
+    },
+    {
+      "label": "yarn: build",
+      "type": "shell",
+      "command": "yarn",
+      "args": [
+        "build"
       ],
     }
   ]

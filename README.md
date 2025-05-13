@@ -52,24 +52,32 @@ The script will:
 2. Prompt you to select a GitHub Codespace
 3. Establish a secure port forwarding channel for authentication
 4. Start an interactive SSH session
+5. Automatically forward other detected application ports from the codespace to your local machine.
 
 Inside your codespace, tools like `git`, `npm`, and NuGet will automatically use the authentication provided by this service through the tooling provided by [Artifacts Helper](https://github.com/microsoft/codespace-features/tree/main/src/artifacts-helper).
 
 ## How It Works
+
+Under the hood, this tool provides two main functionalities: Azure DevOps authentication and automatic port forwarding.
+
+### Authentication Flow
+
+The authentication system enables tools inside your codespace to securely access Azure DevOps resources using your local credentials:
 
 ```mermaid
 graph
     subgraph "Local Machine"
         AzCLI["Azure CLI"]
         AuthSvc["ADO Auth Service<br>(Node.js + @azure/identity)"]
-        SSH["GitHub CLI SSH"]
+        MainSSH["SSH Connection<br>(Interactive Session)"]
+        
         AzCLI -->|provides credentials| AuthSvc
-        AuthSvc -->|listens on port 9000| SSH
+        AuthSvc -->|listens on port 9000| MainSSH
     end
     
     subgraph "GitHub Codespace"
         SSHSrv["SSH Server"]
-        SocketPath["Unix Socket<br>(direct SSH socket forwarding)"]
+        SocketPath["Unix Socket<br>(/tmp/ado-auth-*.sock)"]
         ADOHelper["ADO Auth Helper<br>(from ado-codespaces-auth)"]
         Tools["Development Tools<br>(git, npm, dotnet, etc.)"]
         
@@ -80,18 +88,51 @@ graph
         ADOHelper -->|requests token via IPC| SocketPath
     end
     
-    SSH -->|Remote Port Forwarding<br>-R /tmp/ado-auth-*.sock:localhost:9000| SSHSrv
+    MainSSH -->|Remote Port Forwarding<br>-R /tmp/ado-auth-*.sock:localhost:9000| SSHSrv
     SocketPath -.->|node-ipc over socket| AuthSvc
     Tools -.->|auth with ADO| Ext["Azure DevOps Services"]
 ```
 
-Under the hood, this tool:
+1. **Local Authentication Service**: A Node.js service using the `@azure/identity` package connects to your Azure CLI credentials and listens for token requests
+2. **SSH Socket Forwarding**: An SSH connection forwards the local authentication service to a Unix socket in the codespace using remote socket forwarding
+3. **Token Delivery**: Development tools inside the codespace request tokens through the ADO Auth Helper, which communicates with your local authentication service
 
-1. **Local Authentication Service**: Starts a Node.js service using the `@azure/identity` package that connects to your Azure CLI credentials
-2. **SSH Socket Forwarding**: Establishes an SSH connection that directly forwards the local authentication service to a Unix socket in the codespace using SSH's remote socket forwarding capability
-3. **Token Delivery**: Provides ADO access tokens to tools inside the codespace when needed
+### Automatic Port Forwarding
 
-This approach leverages the same tools and workflows that the official ADO Codespaces authentication helpers provide.
+The port forwarding system automatically detects and forwards application ports from your codespace:
+
+```mermaid
+graph
+    subgraph "Local Machine"
+        MainSSH["Main SSH Connection"]
+        FIFO["Named Pipe<br>(Port Monitor FIFO)"]
+        PFM["Port-Forward-Manager"]
+        Browser["Web Browser<br>(or Local Client)"]
+        
+        MainSSH -->|writes port events to| FIFO
+        FIFO -->|reads port events from| PFM
+    end
+    
+    subgraph "GitHub Codespace"
+        SSHSrv["SSH Server"]
+        PortMon["Port Monitor"]
+        Apps["Applications<br>(web servers, etc.)"]
+        
+        Apps -->|opens ports| PortMon
+        PortMon -->|detects new ports| MainSSH
+    end
+    
+    PFM -->|creates SSH tunnels<br>gh cs ssh -c $CODESPACE -L localhost:port:localhost:port| SSHSrv
+    Browser -->|connects to<br>localhost:port| SSHSrv
+    SSHSrv -->|forwards to| Apps
+```
+
+1. **Port Detection**: The `port-monitor` service runs in your codespace and detects when applications start listening on network ports
+2. **Event Communication**: Port events are sent through the main SSH connection to a named pipe (FIFO) on your local machine
+3. **Tunnel Creation**: The `port-forward-manager` script reads from the FIFO and creates SSH tunnels (`gh cs ssh -L`) for each detected port
+4. **Local Access**: Applications running in your codespace become accessible via `localhost:<port>` on your local machine
+
+This approach leverages the same tools and workflows that the official ADO Codespaces authentication helpers provide, while adding seamless port forwarding capabilities.
 
 ## Adding Additional Port Forwarding
 

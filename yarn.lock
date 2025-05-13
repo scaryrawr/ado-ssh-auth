@@ -2372,6 +2372,20 @@ __metadata:
   languageName: node
   linkType: hard
 
+"port-monitor@workspace:apps/port-monitor":
+  version: 0.0.0-use.local
+  resolution: "port-monitor@workspace:apps/port-monitor"
+  dependencies:
+    "@eslint/js": "npm:^9.26.0"
+    "@types/eslint": "npm:^9.6.1"
+    "@types/node": "npm:^22.15.17"
+    eslint: "npm:^9.26.0"
+    globals: "npm:^16.1.0"
+    typescript: "npm:^5.8.3"
+    typescript-eslint: "npm:^8.32.0"
+  languageName: unknown
+  linkType: soft
+
 "prelude-ls@npm:^1.2.1":
   version: 1.2.1
   resolution: "prelude-ls@npm:1.2.1"
