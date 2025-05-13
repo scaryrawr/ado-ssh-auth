@@ -16,6 +16,24 @@
       "problemMatcher": [
         "$tsc"
       ]
+    },
+    {
+      "label": "yarn: build - ado-auth-service",
+      "type": "shell",
+      "command": "yarn",
+      "args": [
+        "build",
+        "--to",
+        "ado-auth-service"
+      ],
+    },
+    {
+      "label": "yarn: build",
+      "type": "shell",
+      "command": "yarn",
+      "args": [
+        "build"
+      ],
     }
   ]
 }
