@@ -24,6 +24,27 @@
         "${workspaceFolder}/**/*.js",
         "!**/node_modules/**"
       ]
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Port Monitor",
+      "skipFiles": [
+        "<node_internals>/**"
+      ],
+      "preLaunchTask": "yarn: build - port-monitor",
+      "program": "${workspaceFolder}/apps/port-monitor/lib/index.js",
+      "outFiles": [
+        "${workspaceFolder}/apps/port-monitor/lib/**/*.js"
+      ],
+      "sourceMaps": true,
+      "sourceMapPathOverrides": {
+        "./src/*": "${workspaceFolder}/apps/port-monitor/src/*"
+      },
+      "resolveSourceMapLocations": [
+        "${workspaceFolder}/**/*.js",
+        "!**/node_modules/**"
+      ]
     }
   ]
 }
